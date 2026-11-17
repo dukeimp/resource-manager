@@ -1,0 +1,21 @@
+name = "resource-manager"
+main = "worker.js"
+compatibility_date = "2026-07-15"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "resource-manager"
+database_id = "YOUR_D1_DATABASE_ID_HERE"
+
+[assets]
+directory = "./static"
+binding = "ASSETS"
+
+# 定时任务：
+#   "* * * * *" → 每分钟唤醒一次，由 fetch_tasks 表中配置的间隔
+#                 判断具体执行哪些任务（间隔、启停均可在「数据采集」页配置）。
+#                 金价快照采集（metal_snapshot）默认 30 分钟一次，快照数据全部入库。
+#   任务间隔由数据库按秒配置，范围为 5～86400 秒；低于 60 秒的部分由页面访问补采。
+# 本地调试可加 --test-scheduled 手动触发；页面访问也会按间隔自动补采（见 captureMetalSnapshotIfDue）
+[triggers]
+crons = ["* * * * *"]
