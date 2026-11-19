@@ -338,13 +338,25 @@ const BANK_GOLD_TABLE_SQL = `CREATE TABLE IF NOT EXISTS bank_gold_quotes (
 
 // ============================================================
 // 迁移（向前兼容：仅创建资讯表与默认菜单/设置）
-//   迁移是幂等的，但每次 API 请求都跑一遍 30+ 条 DDL/DML 会明显拖慢响应。
 //   用实例级标志位缓存「已迁移」状态：同一 isolate 只执行一次；
-//   实例回收后标志重置并重新执行（幂等，安全）。
+//   实例回收后标志重置，此时靠下面的「版本闸门」再挡一次，不做任何写入。
 //   失败时不置位，保证下次请求能重试。
 // ============================================================
 let migrateDone = false;
 let migratePending = null;
+
+// 迁移版本号 —— 改动 migrate() 里的建表 / 种子 / 兼容 UPDATE 时**必须**把它 +1。
+//
+// 为什么需要它：migrate() 里有 200+ 条 DDL / INSERT OR IGNORE / UPDATE。
+//   D1 的计费口径是「写入行数」：
+//     · INSERT OR IGNORE 即使因唯一键冲突被忽略，也照算一行写入；
+//     · UPDATE 即使把字段写成原值，也照算一行写入；
+//     · 只会被索引命中的表，每个索引还会再加一行。
+//   每个新 isolate 都跑一遍完整迁移（cron 每分钟一个新实例 ≈ 每天 500~700 次），
+//   单这一块每天就烧掉 5 万+ 写入行，直接把免费额度（10 万/天）打爆。
+//   有了版本闸门，同一个库在版本号不变时只读一个 settings 键就返回，
+//   真正的迁移只在「首次部署 / 版本号变更」时跑一次。
+const MIGRATE_VERSION = "2026-11-19.3";
 
 // 结构化日志：便于在 Cloudflare 日志面板中定位问题（替代被静默吞掉的异常）
 function logWarn(scope, err, extra) {
@@ -376,6 +388,21 @@ async function migrate(env) {
     if (migrateDone) return true;
     if (migratePending) return migratePending;
     migratePending = (async () => {
+    // —— 版本闸门 ——
+    //   settings 表已存在且版本号与代码一致 → 这个库已经迁移过了，直接返回（只读 1 行）。
+    //   空库 / 旧库（没有 settings 表、或没有 migrate_ver）会落到下面的完整迁移。
+    let gateHit = false;
+    try {
+        const stamp = await env.DB.prepare("SELECT value FROM settings WHERE key='migrate_ver'").first();
+        gateHit = !!(stamp && String(stamp.value || "") === MIGRATE_VERSION);
+    } catch (e) { /* settings 不存在：全新库，继续完整迁移 */ }
+    if (gateHit) {
+        migrateDone = true;
+        // 跳过建表 / 种子，但「规则回填」必须照常自检：它们各自带 settings 版本戳，
+        //   版本一致时只读 1 行；词表 / 屏蔽词变了才会重算。放在闸门里会永远跑不到。
+        await runRuleBackfills(env);
+        return true;
+    }
     try {
         // 迁移分两阶段批量提交：
         //   D1 的 batch() 会先解析整批语句，同一批里「先建表、后引用该表」会直接报错，
@@ -404,6 +431,8 @@ async function migrate(env) {
         db.push(P(BANK_GOLD_TABLE_SQL));
         // 登录失败限流状态（原来放 isolate 内存，多实例下等于没限流）
         db.push(P("CREATE TABLE IF NOT EXISTS login_attempts (key TEXT PRIMARY KEY, fails INTEGER NOT NULL DEFAULT 0, first_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0)"));
+        // 聚合结果缓存（跨 isolate / 跨机房共享：一次轮询只读 1 行，而不是重扫 news 表）
+        db.push(P("CREATE TABLE IF NOT EXISTS agg_cache (key TEXT PRIMARY KEY, val TEXT NOT NULL DEFAULT '', at INTEGER NOT NULL DEFAULT 0)"));
         // 价格预警（目标价 / 涨跌幅阈值）
         db.push(P("CREATE TABLE IF NOT EXISTS price_alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, name TEXT DEFAULT '', direction TEXT NOT NULL DEFAULT 'above', target REAL NOT NULL DEFAULT 0, cooldown_min INTEGER NOT NULL DEFAULT 30, enabled INTEGER NOT NULL DEFAULT 1, note TEXT DEFAULT '', trigger_count INTEGER NOT NULL DEFAULT 0, last_trigger_epoch INTEGER NOT NULL DEFAULT 0, last_trigger_at TEXT DEFAULT '', last_trigger_price REAL NOT NULL DEFAULT 0, created_by TEXT DEFAULT '', created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)"));
         // 站内通知（dedup_key 唯一，冷却窗口内同一事件只落一条）
@@ -578,14 +607,6 @@ async function migrate(env) {
             { name: "key_reasons", ddl: "TEXT DEFAULT ''" },
             { name: "key_brief", ddl: "TEXT DEFAULT ''" }
         ]);
-        // 存量数据补 relevant 标记（版本号一致时只查一次 settings 就返回）
-        try { await backfillNewsRelevance(env); } catch (e) { logWarn("migrate.newsRelevance", e); }
-        // 存量消息补研判（规则版本变更时自动重算，人工改判过的行保留）
-        try { await backfillImpact(env); } catch (e) { logWarn("migrate.impactBackfill", e); }
-        // 存量消息补「重点」评分（挑选算法版本变更时自动重算）
-        try { await backfillKeyPick(env); } catch (e) { logWarn("migrate.keyPickBackfill", e); }
-        // 冷启动把库内全部重点消息同步进通知中心（幂等；未读的即为「点亮」状态）
-        try { await syncKeyNotifications(env); } catch (e) { logWarn("migrate.keyNotifySync", e); }
         // 兼容旧库：补齐 domain 列
         await ensureColumns(env, "data_sources", [{ name: "domain", ddl: "TEXT NOT NULL DEFAULT 'news'" }]);
         await ensureColumns(env, "fetch_tasks", [
@@ -809,6 +830,20 @@ async function migrate(env) {
             ));
         } catch (e) { logWarn("migrate.retentionOptions", e); }
 
+        // 存量数据补 relevant 标记 / 研判 / 重点评分（各自的版本戳一致时只读 1 行）。
+        //   放在全部种子与兼容 UPDATE 之后：屏蔽词的规范化也在上面完成，
+        //   否则会用「规范化前」的屏蔽词算一遍 relevant，白白多跑一轮回填。
+        await runRuleBackfills(env);
+        // 冷启动把库内全部重点消息同步进通知中心（幂等；未读的即为「点亮」状态）
+        try { await syncKeyNotifications(env); } catch (e) { logWarn("migrate.keyNotifySync", e); }
+
+        // 记录迁移版本：后续新 isolate 只读这一个键就返回，不再重复写种子 / 兼容 UPDATE。
+        //   写入失败也置位（避免同一实例里每次请求都重跑一遍完整迁移），下个实例会再试。
+        try {
+            await env.DB.prepare("INSERT INTO settings(key,value) VALUES('migrate_ver',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+                .bind(MIGRATE_VERSION).run();
+        } catch (e) { logWarn("migrate.version", e); }
+
         migrateDone = true;
         return true;
     } catch (e) {
@@ -999,6 +1034,26 @@ function newsTitleRelevant(title) {
     if (!t) return false;
     return NEWS_RELEVANCE_ALL.some(w => termMatches(t, w));
 }
+
+// 屏蔽词命中判定：与原先 SQL 侧 `title||' '||summary||' '||keywords LIKE '%w%'` 同口径
+//   （LIKE 对 ASCII 不区分大小写，这里统一转小写；中文不受影响）
+function newsBlacklistHit(blacklist, row) {
+    if (!blacklist || !blacklist.length) return false;
+    const r = row || {};
+    const hay = [r.title, r.summary, r.keywords].map(v => String(v == null ? "" : v)).join(" ").toLowerCase();
+    if (!hay.trim()) return false;
+    return blacklist.some(w => w && hay.includes(String(w).toLowerCase()));
+}
+
+// 结构化「是否保留」标记（1 保留 / 0 过滤）：
+//   命中四类白名单 **且** 不命中屏蔽词。
+//   把屏蔽词也烘进 relevant 之后，查询端只判 `relevant = 1`（走 idx_news_rel），
+//   不必再给每条聚合 SQL 拼 N 个 `NOT LIKE`（SQLite 只能逐行全表扫，实测单次 4~6 千行）。
+function newsRelevantFlag(row, blacklist) {
+    const r = row || {};
+    if (!newsTitleRelevant(r.title)) return 0;
+    return newsBlacklistHit(blacklist, r) ? 0 : 1;
+}
 // 采集端要给出「为什么留下」的原因，便于日志排查
 function newsRelevanceHit(title) {
     const t = String(title || "").toLowerCase();
@@ -1010,25 +1065,33 @@ function newsRelevanceHit(title) {
 }
 
 // 词表版本：改了 NEWS_RELEVANCE_TERMS 就把版本号 +1，重启后会自动重算历史数据的 relevant 标记
-const NEWS_RELEVANCE_VERSION = "v3-20261112-ai2";
+//   v4（2026-11-19）：屏蔽词也并入 relevant —— 命中屏蔽词的行同样记 0，
+//   查询端就能只判 `relevant = 1`，不再拼一堆 NOT LIKE 做全表扫描。
+const NEWS_RELEVANCE_VERSION = "v4-20261119-blacklist";
 let RELEVANCE_BACKFILLED = "";
 // 给存量数据补 relevant 标记（历史行入库时还没有这个字段，默认都是 1）
-//   进度记在 settings.news_relevance_ver，版本一致就直接跳过；isolate 内再缓存一次，避免每个请求都查库
+//   进度记在 settings.news_relevance_ver，版本一致就直接跳过；isolate 内再缓存一次，避免每个请求都查库。
+//   令牌里带上屏蔽词的指纹：用户改了屏蔽词 → 自动重算一次（否则旧的 0/1 会一直沿用）。
 async function backfillNewsRelevance(env) {
-    if (RELEVANCE_BACKFILLED === NEWS_RELEVANCE_VERSION) return;
+    // 直接单行读取屏蔽词（不要走 acquireOptionMap：那会整表读 29 行，
+    //   而这里是「每次冷启动都要自检」的热路径，只需要 1 行 + 1 行版本戳）
+    const blRow = await env.DB.prepare("SELECT value FROM acquire_options WHERE option_key='news_blacklist'").first().catch(() => null);
+    const blacklist = splitList(blRow ? blRow.value : "");
+    const token = NEWS_RELEVANCE_VERSION + "|bl:" + newsHash(blacklist.join(","));
+    if (RELEVANCE_BACKFILLED === token) return;
     const cur = await env.DB.prepare("SELECT value FROM settings WHERE key='news_relevance_ver'").first().catch(() => null);
-    if (cur && String(cur.value || "") === NEWS_RELEVANCE_VERSION) { RELEVANCE_BACKFILLED = NEWS_RELEVANCE_VERSION; return; }
+    if (cur && String(cur.value || "") === token) { RELEVANCE_BACKFILLED = token; return; }
     let lastId = 0;
     for (let round = 0; round < 200; round++) {
-        const page = (await env.DB.prepare("SELECT id,title FROM news WHERE id > ? ORDER BY id LIMIT 200").bind(lastId).all()).results || [];
+        const page = (await env.DB.prepare("SELECT id,title,summary,keywords FROM news WHERE id > ? ORDER BY id LIMIT 200").bind(lastId).all()).results || [];
         if (!page.length) break;
-        const stmts = page.map(r => env.DB.prepare("UPDATE news SET relevant=? WHERE id=?").bind(newsTitleRelevant(r.title) ? 1 : 0, r.id));
+        const stmts = page.map(r => env.DB.prepare("UPDATE news SET relevant=? WHERE id=?").bind(newsRelevantFlag(r, blacklist), r.id));
         for (let i = 0; i < stmts.length; i += 50) await env.DB.batch(stmts.slice(i, i + 50));
         lastId = page[page.length - 1].id;
     }
     await env.DB.prepare("INSERT INTO settings(key,value) VALUES('news_relevance_ver',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
-        .bind(NEWS_RELEVANCE_VERSION).run();
-    RELEVANCE_BACKFILLED = NEWS_RELEVANCE_VERSION;
+        .bind(token).run();
+    RELEVANCE_BACKFILLED = token;
 }
 
 // 给存量消息补「影响研判」。版本记在 settings.news_impact_ver，规则词表改动后 bump
@@ -1097,9 +1160,17 @@ async function backfillKeyPick(env) {
     } catch (e) { logWarn("migrate.keyNotifyCleanup", e); }
 }
 
+// 规则回填入口：三个回填各自带 settings 版本戳，版本一致时只读 1 行就返回。
+//   ⚠️ 必须同时挂在「迁移版本闸门命中」的分支上（见 migrate()），
+//   否则闸门一命中，之后改词表 / 屏蔽词就再也不会对存量库生效了。
+async function runRuleBackfills(env) {
+    try { await backfillNewsRelevance(env); } catch (e) { logWarn("rules.newsRelevance", e); }
+    try { await backfillImpact(env); } catch (e) { logWarn("rules.impact", e); }
+    try { await backfillKeyPick(env); } catch (e) { logWarn("rules.keyPick", e); }
+}
+
 // 容错解析重点评分 JSON（坏数据一律当空）
-function parseKeyPick(raw) {
-    try { const o = JSON.parse(String(raw || "")); return (o && typeof o === "object") ? o : null; }
+function parseKeyPick(raw) {    try { const o = JSON.parse(String(raw || "")); return (o && typeof o === "object") ? o : null; }
     catch (e) { return null; }
 }
 
@@ -2286,13 +2357,14 @@ async function crawlNews(env, opts = {}) {
 
     let inserted = 0;
     const insertedHashes = [];
-    // relevant：标题是否与「品种 / 中国政策 / 金价驱动 / AI 相关（直接+间接）」四类白名单相关，入库时算好存成标记位。
-    //   查询侧只判 `relevant = 1`，不用把 100 多个关键词拼成 SQL（D1 单条最多 100 个绑定参数，拼 LIKE 会直接超限）
+    // relevant：标题是否与「品种 / 中国政策 / 金价驱动 / AI 相关（直接+间接）」四类白名单相关 **且** 未命中屏蔽词，
+    //   入库时算好存成标记位（newsRelevantFlag）。查询侧只判 `relevant = 1`：
+    //   既不用把 100 多个关键词拼成 SQL（D1 单条最多 100 个绑定参数），也不用逐行跑 N 个 NOT LIKE。
     const stmt = env.DB.prepare("INSERT OR IGNORE INTO news(title,summary,url,source,platform,channel,keywords,symbols,published_at,fetched_at,hash,starred,sentiment,sentiment_map,relevant,impact,key_score,is_key,key_reasons,key_brief) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
     const fetchedAt = nowBeijing();
     for (let i = 0; i < rows.length; i += 40) {
         const chunk = rows.slice(i, i + 40);
-        const results = await env.DB.batch(chunk.map(r => stmt.bind(r.title, r.summary, r.url, r.source, r.platform, r.channel, r.keywords, r.symbols || "", r.published_at, fetchedAt, r.hash, r.starred, r.sentiment || "neutral", r.sentiment_map || "{}", newsTitleRelevant(r.title) ? 1 : 0, r.impact || "", r.key_score || 0, r.is_key || 0, r.key_reasons || "", r.key_brief || "")));
+        const results = await env.DB.batch(chunk.map(r => stmt.bind(r.title, r.summary, r.url, r.source, r.platform, r.channel, r.keywords, r.symbols || "", r.published_at, fetchedAt, r.hash, r.starred, r.sentiment || "neutral", r.sentiment_map || "{}", newsRelevantFlag(r, blacklist), r.impact || "", r.key_score || 0, r.is_key || 0, r.key_reasons || "", r.key_brief || "")));
         results.forEach((x, idx) => {
             const ch = (x.meta && x.meta.changes) || 0;
             if (ch) { inserted++; insertedHashes.push(chunk[idx].hash); }
@@ -2362,7 +2434,7 @@ async function crawlNews(env, opts = {}) {
 //   保留：清理失效的重点通知（指向的消息已不再被点亮 / 已超出保留窗口），避免通知中心无限堆积。
 const KEY_NOTIFY_KEEP_DAYS = 7;
 // 通知正文的格式版本：文案结构变了（加简报、改版式）就把已存在的通知正文刷新一遍，只跑一次
-const KEY_NOTIFY_BODY_VERSION = "v1-20261113-brief1";
+const KEY_NOTIFY_BODY_VERSION = "v2-20261119-detail";
 
 // 重点消息的通知文案：第一行给「简明摘要」，后面补分数 / 方向 / 传导链，最后标明是规则推演
 function keyNotifyText(r) {
@@ -2379,11 +2451,18 @@ function keyNotifyText(r) {
         || (kp && kp.brief ? String(kp.brief) : "")
         || String(r.title || "").slice(0, 60);
     const title = "【重点】" + String(r.title || "").slice(0, 60);
+    const meta = [
+        r.source ? "来源：" + r.source : "",
+        r.channel ? "频道：" + r.channel : ""
+    ].filter(Boolean).join(" · ");
     const body = [
         brief,
         "重点 " + (r.key_score || 0) + " 分 · " + dirLabel + (tgt ? " · 影响 " + tgt : ""),
+        meta,
+        r.published_at ? "发布：" + r.published_at : "",
         chain ? "传导链：" + chain : "",
         reasons.length ? "挑选依据：" + reasons.slice(0, 2).join("；") : "",
+        r.url ? "原文：" + r.url : "",
         "规则推演，非投资建议"
     ].filter(Boolean).join("\n");
     return { title, body };
@@ -2391,12 +2470,36 @@ function keyNotifyText(r) {
 
 // 全量同步：所有重点消息进通知中心（静默入库，不触发 webhook）
 //   ⚠ migrate() 在每个 API 请求前都会跑，所以这里必须有「快速通道」：
-//     先用一条只读 COUNT 判断「有没有还没进通知中心的重点消息」+「正文格式版本有没有变」，
-//     两样都没有就直接返回，不做任何写操作 —— 否则每次请求都要写上百条通知，D1 写配额扛不住。
+//     · 第一道：同步令牌（规则版本 + 最大消息 id）。重点消息集合只会在「有新消息入库」或
+//       「重点/研判/正文规则版本变化」时改变 —— 令牌没变就直接返回，只读 1 行。
+//       早期版本这里只有 COUNT 扫描，实测每天 604 次 × 约 3,960 行 = 2.39M 行读取，
+//       单这一条 SQL 就吃掉免费读额度（5M/天）的近一半。
+//     · 第二道：COUNT 只判断「有没有还没进通知中心的重点消息」+「正文格式版本有没有变」，
+//       两样都没有就返回，不做任何写操作。
 async function syncKeyNotifications(env) {
     const enabled = (await acquireOption(env, "news", "news_key_notify_enabled", "1")) === "1";
     if (!enabled) return 0;
     const cutoff = new Date(Date.now() + 8 * 3600 * 1000 - KEY_NOTIFY_KEEP_DAYS * 86400000).toISOString().slice(0, 10);
+
+    // ⓪ 同步令牌：规则版本 + 当前最大消息 id 都没变 → 不可能有新重点消息，直接返回
+    let wantToken = "";
+    try {
+        const t = await env.DB.prepare(
+            "SELECT (SELECT MAX(id) FROM news) AS max_id, "
+            + "(SELECT value FROM settings WHERE key='news_key_notify_token') AS token"
+        ).first();
+        wantToken = [KEY_PICK_VERSION, IMPACT_VERSION, KEY_NOTIFY_BODY_VERSION, Number((t && t.max_id) || 0)].join("|");
+        if (t && String(t.token || "") === wantToken) return 0;
+    } catch (e) { wantToken = ""; /* 读不到令牌就照常走完整流程 */ }
+    const markSynced = async () => {
+        if (!wantToken) return 0;
+        try {
+            await env.DB.prepare("INSERT INTO settings(key,value) VALUES('news_key_notify_token',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+                .bind(wantToken).run();
+        } catch (e) { logWarn("notify.keySync.token", e); }
+        return 0;
+    };
+
     // ① 快速通道：缺多少条 + 正文版本是否需要刷新
     let missCnt = 0;
     try {
@@ -2411,7 +2514,7 @@ async function syncKeyNotifications(env) {
         const ver = await env.DB.prepare("SELECT value FROM settings WHERE key='news_notify_body_ver'").first();
         needRefresh = !ver || String(ver.value || "") !== KEY_NOTIFY_BODY_VERSION;
     } catch (e) { needRefresh = false; }
-    if (!missCnt && !needRefresh) return 0;
+    if (!missCnt && !needRefresh) return markSynced();
 
     let rows = [];
     try {
@@ -2420,7 +2523,7 @@ async function syncKeyNotifications(env) {
             + "WHERE is_key=1 AND substr(published_at,1,10) >= ? ORDER BY key_score DESC, published_at DESC LIMIT 500"
         ).bind(cutoff).all()).results || [];
     } catch (e) { logWarn("notify.keySync.query", e); return 0; }
-    if (!rows.length) return 0;
+    if (!rows.length) return markSynced();
     let added = 0;
     for (const r of rows) {
         const t = keyNotifyText(r);
@@ -2452,6 +2555,7 @@ async function syncKeyNotifications(env) {
                 .bind(KEY_NOTIFY_BODY_VERSION).run();
         } catch (e) { logWarn("notify.keySync.ver", e); }
     }
+    await markSynced();
     return added;
 }
 
@@ -2527,6 +2631,9 @@ function newsDateWindow(days) {
 //   否则会出现「列表 285、统计 537」这种对不上的情况（历史教训）。
 //   例外：① 用户显式搜索某词时不按相关性过滤（主动查询不该空手而归）
 //        ② skipFilter=true 看全量（导出 / 排查）
+//   2026-11-19：屏蔽词已经烘进 `relevant`（入库 / 回填时写入 0），
+//     默认路径只需 `relevant = 1` 一个条件 → 走 idx_news_rel，不再逐行跑 N 个 NOT LIKE。
+//     只有「关掉相关性过滤」或「带关键词搜索」时才退回 LIKE 兜底（这两条都不是轮询路径）。
 async function newsRelevanceFilter(env, opts) {
     const o = opts || {};
     const keyword = o.keyword || "";
@@ -2536,13 +2643,65 @@ async function newsRelevanceFilter(env, opts) {
     const relevanceOnly = (await acquireOption(env, "news", "news_relevance_only", "1")) === "1";
     const parts = [];
     const params = [];
-    if (blacklist.length && !skipFilter && !keywordAsksBlocked) {
+    // 默认轮询路径：relevant 已同时代表「命中白名单 + 未命中屏蔽词」
+    const flagOnly = relevanceOnly && !skipFilter && !keyword;
+    if (blacklist.length && !skipFilter && !keywordAsksBlocked && !flagOnly) {
         parts.push(blacklist.map(() => "NOT (IFNULL(title,'')||' '||IFNULL(summary,'')||' '||IFNULL(keywords,'') LIKE ?)").join(" AND "));
         params.push(...blacklist.map(w => "%" + w + "%"));
     }
     // 相关性：只判入库时算好的 relevant 标记（不放 100+ 个 LIKE，D1 单条 SQL 最多 100 个绑定参数）
-    if (relevanceOnly && !skipFilter && !keyword) parts.push("relevant = 1");
+    if (flagOnly) parts.push("relevant = 1");
     return { cond: parts.length ? parts.map(p => "(" + p + ")").join(" AND ") : "", params };
+}
+
+// —— 聚合缓存（读配额保护，L1 内存 + L2 D1 表）——
+//   页面轮询（资讯 30 秒 / 总览 30 秒）会反复打同一组 COUNT / GROUP BY，
+//   而 D1 免费额度按「扫描行数」计费。这里只缓存统计聚合（不含列表和行情）。
+//   TTL 2 分钟：统计数字晚 2 分钟不影响决策（列表 / 行情 / 重点消息仍是实时）。
+//   写操作会调 invalidateAggCache(env) 主动失效（L1 与 L2 一起清）。
+const AGG_CACHE = new Map();
+const AGG_CACHE_TTL_MS = 120000;
+const AGG_CACHE_MAX = 120;
+// 两级缓存：
+//   L1 = 本 isolate 的 Map（零成本，但 isolate 被回收就没了，而且同一个用户的不同请求
+//        经常落到不同的 isolate / 机房，实测命中率接近 0）
+//   L2 = D1 里的 agg_cache 表（跨 isolate / 跨机房共享，读 1 行、写 1 行）
+//   实测证明只靠 L1 挡不住轮询：把 TTL 从 45 秒提到 3 分钟，命中率依然接近 0。
+async function aggCached(env, key, fn, ttlMs) {
+    const ttl = ttlMs || AGG_CACHE_TTL_MS;
+    const now = Date.now();
+    const hit = AGG_CACHE.get(key);
+    if (hit && now - hit.at < ttl) return hit.val;
+    if (env && env.DB) {
+        try {
+            const row = await env.DB.prepare("SELECT val, at FROM agg_cache WHERE key=?").bind(key).first();
+            if (row && now - (Number(row.at) || 0) < ttl) {
+                const val = JSON.parse(row.val);
+                AGG_CACHE.set(key, { at: Number(row.at) || now, val });
+                return val;
+            }
+        } catch (e) { /* 表还没建 / JSON 损坏：退化为直接计算 */ }
+    }
+    const val = await fn();
+    if (AGG_CACHE.size >= AGG_CACHE_MAX) {
+        for (const [k, v] of AGG_CACHE) if (now - v.at >= ttl) AGG_CACHE.delete(k);
+        if (AGG_CACHE.size >= AGG_CACHE_MAX) AGG_CACHE.clear();
+    }
+    AGG_CACHE.set(key, { at: now, val });
+    if (env && env.DB) {
+        try {
+            await env.DB.prepare("INSERT INTO agg_cache(key,val,at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET val=excluded.val, at=excluded.at")
+                .bind(key, JSON.stringify(val), now).run();
+        } catch (e) { /* 缓存写失败不影响返回 */ }
+    }
+    return val;
+}
+// 写操作后主动失效（资讯新增 / 删除 / 收藏 / 重算都走 saveNews，统计会立刻变）
+async function invalidateAggCache(env) {
+    AGG_CACHE.clear();
+    if (env && env.DB) {
+        try { await env.DB.prepare("DELETE FROM agg_cache").run(); } catch (e) { /* 表未建时忽略 */ }
+    }
 }
 
 // 统计最近若干天每天的消息条数（补齐空缺日期）
@@ -2555,7 +2714,7 @@ async function newsDailyTrend(env, days, extra) {
     const exParams = (extra && extra.params) || [];
     let rows = [];
     try {
-        rows = (await env.DB.prepare("SELECT substr(published_at,1,10) d, COUNT(*) c FROM news WHERE substr(published_at,1,10) >= ?" + ex + " GROUP BY d").bind(from, ...exParams).all()).results || [];
+        rows = (await env.DB.prepare("SELECT substr(published_at,1,10) d, COUNT(*) c FROM news WHERE published_at >= ?" + ex + " GROUP BY d").bind(from, ...exParams).all()).results || [];
     } catch (e) { logWarn("news.trend", e); }
     const map = {};
     rows.forEach(r => { map[r.d] = r.c || 0; });
@@ -2584,6 +2743,110 @@ async function newsHotKeywords(env, limit, extra) {
         .map(k => ({ keyword: k, count: map[k] }))
         .sort((a, b) => b.count - a.count)
         .slice(0, top);
+}
+
+// 日期字符串 +1 天（bundle 的「今日」区间用 published_at >= 今天 AND < 明天，
+//   而不是 substr(published_at,1,10)=?：后者用不上 idx_news_rel，每轮都要扫全表）
+function nextDayStr(day) {
+    const d = new Date(String(day) + "T00:00:00Z");
+    if (isNaN(d.getTime())) return String(day);
+    d.setUTCDate(d.getUTCDate() + 1);
+    return d.toISOString().slice(0, 10);
+}
+
+// —— 资讯统计聚合（/api/news 侧栏 + /api/desk 系统概览共用同一份缓存）——
+//   两个页面轮询的其实是同一组 COUNT / GROUP BY（默认都是 `relevant = 1`），
+//   用同一个缓存键就只算一次。列表 rows / 行情 / 日历 / 预警都不在这里（保持实时）。
+//   成本：以前是 5 个 COUNT + 3 个 GROUP BY 各扫一遍 news（约 9,800 行/次），
+//   现在合并成「1 条聚合 + 1 条明细」两遍扫描（约 2,000 行/次），分布 / 趋势 / 热词在 JS 里算。
+async function newsStatsBundle(env, cond, params, today) {
+    const p = params || [];
+    const ex = cond ? " AND " + cond : "";
+    const day = today || nowBeijing().slice(0, 10);
+    const next = nextDayStr(day);
+    const key = "news.stats|" + day + "|" + (cond || "") + "|" + JSON.stringify(p);
+    return aggCached(env, key, async () => {
+        // 明细上限：分布 / 热词只看最近这么多条（当前全库约 1,000 条，够用且防未来暴涨）
+        const DETAIL_CAP = 3000;
+        const safeStat = async (label, sql, args) => {
+            try { return await env.DB.prepare(sql).bind(...args).first(); }
+            catch (e) { logWarn("news.stats." + label, e); return null; }
+        };
+        const [counts, detail, starred, notif] = await Promise.all([
+            // 一条 SQL 出总量 / 今日 / 重点 / 最新时间（单次扫描，不再拆成 4 个子查询）
+            safeStat("counts",
+                "SELECT COUNT(*) total,"
+                + " SUM(CASE WHEN published_at>=? AND published_at<? THEN 1 ELSE 0 END) today,"
+                + " SUM(CASE WHEN is_key=1 THEN 1 ELSE 0 END) key_count,"
+                + " MAX(published_at) latest FROM news WHERE 1=1" + ex,
+                [day, next, ...p]),
+            (async () => {
+                try {
+                    return (await env.DB.prepare(
+                        "SELECT published_at, sentiment, channel, source, keywords FROM news WHERE 1=1" + ex
+                        + " ORDER BY id DESC LIMIT " + DETAIL_CAP
+                    ).bind(...p).all()).results || [];
+                } catch (e) { logWarn("news.stats.detail", e); return []; }
+            })(),
+            // 收藏数刻意不加过滤：收藏是用户自己的行为，与「相关性白名单」无关
+            safeStat("starred", "SELECT COUNT(*) c FROM news WHERE starred=1", []),
+            // 未读通知按类型分布（总览铃铛用，小表）
+            (async () => {
+                try {
+                    return (await env.DB.prepare("SELECT kind, COUNT(*) c FROM notifications WHERE read=0 GROUP BY kind").all()).results || [];
+                } catch (e) { logWarn("news.stats.notifyKind", e); return []; }
+            })()
+        ]);
+
+        const sentMap = new Map(), chanMap = new Map(), srcMap = new Map(), kwMap = new Map();
+        (detail || []).forEach(r => {
+            const s = r.sentiment == null ? "" : String(r.sentiment);
+            sentMap.set(s, (sentMap.get(s) || 0) + 1);
+            const ch = r.channel == null ? "" : String(r.channel);
+            chanMap.set(ch, (chanMap.get(ch) || 0) + 1);
+            const sc = r.source == null ? "" : String(r.source);
+            srcMap.set(sc, (srcMap.get(sc) || 0) + 1);
+            String(r.keywords || "").split(",").map(k => k.trim()).filter(Boolean)
+                .forEach(k => kwMap.set(k, (kwMap.get(k) || 0) + 1));
+        });
+        // 明细没被截断时，14 天趋势直接由这批行算出（零额外读）；被截断才回退到 SQL 聚合
+        const trend = (detail || []).length >= DETAIL_CAP
+            ? await newsDailyTrend(env, 14, cond ? { cond, params: p } : null)
+            : buildDailyTrend(detail, day, 14);
+        const hotKeywords = [...kwMap.entries()].map(([keyword, count]) => ({ keyword, count }))
+            .sort((a, b) => b.count - a.count).slice(0, 12);
+
+        return {
+            total: Number(counts && counts.total) || 0,
+            today: Number(counts && counts.today) || 0,
+            keyCount: Number(counts && counts.key_count) || 0,
+            starred: Number(starred && starred.c) || 0,
+            latest: (counts && counts.latest) || "",
+            sentiment: [...sentMap.entries()].map(([k, c]) => ({ sentiment: k, c })),
+            channel: [...chanMap.entries()].map(([k, c]) => ({ channel: k, c })),
+            source: [...srcMap.entries()].map(([k, c]) => ({ source: k, c })),
+            trend, hotKeywords,
+            notifyKinds: notif || []
+        };
+    });
+}
+
+// 从明细行算最近 N 天每天的消息条数（补齐空缺日期），口径与 newsDailyTrend 一致
+function buildDailyTrend(rows, day, days) {
+    const span = Math.min(90, Math.max(1, parseInt(days, 10) || 14));
+    const end = new Date(String(day) + "T00:00:00Z");
+    const base = isNaN(end.getTime()) ? new Date() : end;
+    const map = {};
+    (rows || []).forEach(r => {
+        const d = String(r.published_at || "").slice(0, 10);
+        if (d) map[d] = (map[d] || 0) + 1;
+    });
+    const out = [];
+    for (let i = span - 1; i >= 0; i--) {
+        const d = new Date(base.getTime() - i * 86400000).toISOString().slice(0, 10);
+        out.push({ date: d, count: map[d] || 0 });
+    }
+    return out;
 }
 
 async function getNews(url, env) {
@@ -2655,7 +2918,6 @@ async function getNews(url, env) {
     }
 
     const whereSQL = "WHERE " + conditions.join(" AND ");
-    const total = await env.DB.prepare("SELECT COUNT(*) total FROM news " + whereSQL).bind(...params).first();
     // 排序：time=最新优先 / oldest=最早优先 / relevance=命中度优先（有关键词时生效） / key=重点优先
     let orderExpr = "ORDER BY published_at DESC, id DESC";
     let orderParams = [];
@@ -2669,42 +2931,30 @@ async function getNews(url, env) {
     } else if (sort === "relevance") {
         orderExpr = "ORDER BY relevant DESC, key_score DESC, published_at DESC, id DESC";
     }
-    const selectParams = [...params, ...orderParams, limit, offset];
-    // 显式列代替 SELECT *：减少网络传输与反序列化开销（避免把大字段带出）
-    const rows = await env.DB.prepare(
-        "SELECT id,title,summary,url,source,platform,channel,keywords,symbols,sentiment,sentiment_map,impact,key_score,is_key,key_reasons,key_brief,published_at,fetched_at,starred,note FROM news "
-        + whereSQL + " " + orderExpr + " LIMIT ? OFFSET ?"
-    ).bind(...selectParams).all();
 
-    // 统计类查询彼此独立，并行执行以降低首字节时间
+    // 统计类查询与列表并行执行；统计聚合与投资总览共用同一份缓存（见 newsStatsBundle）
     const today = nowBeijing().slice(0, 10);
-    // 侧栏统计与列表同口径：过滤生效时，总量 / 频道分布 / 来源分布 / 趋势 / 热词一并排除
-    const fOnly = filterSql ? "WHERE " + filterSql : "";
-    const fAnd = (extra) => (filterSql ? "WHERE " + filterSql + " AND " + extra : "WHERE " + extra);
-    const [stats, byChannel, bySource, trend, hotKeywords, cfg] = await Promise.all([
+    const [agg, rows, cfg] = await Promise.all([
+        newsStatsBundle(env, conditions.join(" AND "), params, today),
+        // 显式列代替 SELECT *：减少网络传输与反序列化开销（避免把大字段带出）
         env.DB.prepare(
-            "SELECT (SELECT COUNT(*) FROM news " + fOnly + ") total, (SELECT COUNT(*) FROM news WHERE starred=1) starred,"
-            + " (SELECT COUNT(*) FROM news " + fAnd("substr(published_at,1,10)=?") + ") today, (SELECT MAX(published_at) FROM news) latest,"
-            + " (SELECT COUNT(*) FROM news " + fAnd("is_key=1") + ") key_count"
-        ).bind(...filterParams, ...filterParams, today, ...filterParams).first(),
-        env.DB.prepare("SELECT channel, COUNT(*) c FROM news " + fOnly + " GROUP BY channel").bind(...filterParams).all(),
-        env.DB.prepare("SELECT source, COUNT(*) c FROM news " + fOnly + " GROUP BY source").bind(...filterParams).all(),
-        newsDailyTrend(env, 14, filterSql ? { cond: filterSql, params: filterParams } : null),
-        newsHotKeywords(env, 12, filterSql ? { cond: filterSql, params: filterParams } : null),
+            "SELECT id,title,summary,url,source,platform,channel,keywords,symbols,sentiment,sentiment_map,impact,key_score,is_key,key_reasons,key_brief,published_at,fetched_at,starred,note FROM news "
+            + whereSQL + " " + orderExpr + " LIMIT ? OFFSET ?"
+        ).bind(...params, ...orderParams, limit, offset).all(),
         settingsMap(env)
     ]);
 
     return json({
-        total: total.total || 0,
-        rows: rows.results,
+        total: agg.total || 0,
+        rows: rows.results || [],
         query: { keyword, channel, source, starred, symbol, days, sort, date_from: win.from, date_to: win.to, sentiment, impact: impactDir, key: url.searchParams.get("key") === "1" ? 1 : 0 },
         // 前端按该间隔轮询列表（服务端是否回源由「自动抓取间隔」决定）
         live_sec: liveSec,
         stats: {
-            total: stats.total || 0, starred: stats.starred || 0, today: stats.today || 0, latest: stats.latest || "",
-            key_count: stats.key_count || 0,
-            by_channel: byChannel.results, by_source: bySource.results,
-            trend, hot_keywords: hotKeywords,
+            total: agg.total || 0, starred: agg.starred || 0, today: agg.today || 0, latest: agg.latest || "",
+            key_count: agg.keyCount || 0,
+            by_channel: agg.channel, by_source: agg.source,
+            trend: agg.trend, hot_keywords: agg.hotKeywords,
             last_refresh: cfg.last_news_refresh || ""
         }
     });
@@ -2713,6 +2963,9 @@ async function getNews(url, env) {
 async function saveNews(request, env, user) {
     const body = await request.json();
     const action = body.action;
+    // 这里的每个 action 都会改动 news（增删 / 收藏 / 备注 / 重算），聚合统计直接失效，
+    //   避免用户点完收藏后统计卡还要等缓存过期（L1 + D1 缓存一起清）。
+    await invalidateAggCache(env);
     if (action === "star" || action === "unstar") {
         if (!can(user, "news.manage")) return forbidden();
         const id = parseInt(body.id);
@@ -2764,8 +3017,9 @@ async function saveNews(request, env, user) {
         // 新增 / 改名品种后，历史消息需要用新词表重新标注一遍（否则老消息永远贴不上新标的）
         // 同时重算情绪：打标变了，消息对标的的含义也可能变（例如「锂价上涨」原来只贴了铜）
         if (!can(user, "news.manage")) return forbidden();
-        const rows = (await env.DB.prepare("SELECT id,title,summary,channel,source,published_at,sentiment_map FROM news").all()).results || [];
+        const rows = (await env.DB.prepare("SELECT id,title,summary,keywords,channel,source,published_at,sentiment_map FROM news").all()).results || [];
         const instruments = await instrumentRows(env);
+        const retagBlacklist = splitList(await acquireOption(env, "news", "news_blacklist", ""));
         const stmt = env.DB.prepare("UPDATE news SET symbols=?, sentiment=?, sentiment_map=?, relevant=?, impact=?, key_score=?, is_key=?, key_reasons=?, key_brief=? WHERE id=?");
         let done = 0;
         for (let i = 0; i < rows.length; i += 50) {
@@ -2777,7 +3031,7 @@ async function saveNews(request, env, user) {
                 const j = judgeSentiment(text, instruments, syms, prev);
                 const imp = judgeImpact(r.title, r.summary, r.channel);
                 const kp = pickKeyNews(r.title, r.summary, r.channel, imp, r.source, r.published_at || nowBeijing(), Date.now());
-                return stmt.bind(syms.join(","), j.sentiment, JSON.stringify(j.map), newsTitleRelevant(r.title) ? 1 : 0,
+                return stmt.bind(syms.join(","), j.sentiment, JSON.stringify(j.map), newsRelevantFlag(r, retagBlacklist),
                     JSON.stringify(imp), kp.score || 0, kp.isKey ? 1 : 0, JSON.stringify(kp), kp.brief || "", r.id);
             }));
             done += chunk.length;
@@ -2888,8 +3142,9 @@ async function saveNews(request, env, user) {
         const publishedAt = normalizeStamp(body.published_at) || nowBeijing();
         const imp = judgeImpact(title, summary, channel);
         const kp = pickKeyNews(title, summary, channel, imp, "manual", publishedAt, Date.now());
+        const createBlacklist = splitList(await acquireOption(env, "news", "news_blacklist", ""));
         const ins = await env.DB.prepare("INSERT OR IGNORE INTO news(title,summary,url,source,platform,channel,keywords,symbols,published_at,fetched_at,hash,sentiment,sentiment_map,relevant,impact,key_score,is_key,key_reasons,key_brief) VALUES(?,?,?,'manual',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-            .bind(title, summary, safeUrl(body.url), "手动录入", channel, hit.join(","), symbols, publishedAt, nowBeijing(), newsFingerprint(title), judge.sentiment, JSON.stringify(judge.map), newsTitleRelevant(title) ? 1 : 0, JSON.stringify(imp), kp.score, kp.isKey ? 1 : 0, JSON.stringify(kp), kp.brief || "").run();
+            .bind(title, summary, safeUrl(body.url), "手动录入", channel, hit.join(","), symbols, publishedAt, nowBeijing(), newsFingerprint(title), judge.sentiment, JSON.stringify(judge.map), newsRelevantFlag({ title, summary, keywords: hit.join(",") }, createBlacklist), JSON.stringify(imp), kp.score, kp.isKey ? 1 : 0, JSON.stringify(kp), kp.brief || "").run();
         return json({ success: true, inserted: (ins.meta && ins.meta.changes) || 0 });
     }
     return json({ success: false, message: "未知操作" }, 400);
@@ -2988,7 +3243,7 @@ async function handleUsers(request, env, actor) {
 // ============================================================
 const ALERT_DIRECTIONS = { above: "价格上破", below: "价格下破", rise: "涨幅达到", fall: "跌幅达到" };
 // 推送通道类型目录：
-//   webhook 类（企业微信 / 钉钉 / 飞书 / 通用）—— 用户填一个 URL，直接 POST 过去
+//   webhook 类（企业微信 / 钉钉 / 飞书 / 通用 / ShowDoc）—— 用户填一个 URL，直接 POST 过去
 //   token 类（Telegram / 微信推送 PushPlus / Bark）—— 用户填 Token / 设备密钥，由系统拼出官方接口地址
 //   urlLabel / urlPlaceholder / secretLabel / secretPlaceholder 供前端按类型动态渲染表单字段
 const NOTIFY_CHANNEL_TYPES = {
@@ -2999,6 +3254,8 @@ const NOTIFY_CHANNEL_TYPES = {
         secretLabel: "加签 Secret（可选）", secretPlaceholder: "SEC..." },
     feishu:   { label: "飞书机器人", kind: "webhook", icon: "fa-solid fa-comment-dots",
         urlLabel: "Webhook 地址", urlPlaceholder: "https://open.feishu.cn/open-apis/bot/v2/hook/..." },
+    showdoc:  { label: "ShowDoc 推送", kind: "webhook", icon: "fa-solid fa-book-open",
+        urlLabel: "专属推送地址", urlPlaceholder: "https://push.showdoc.com.cn/server/api/push/..." },
     generic:  { label: "通用 JSON Webhook", kind: "webhook", icon: "fa-solid fa-code",
         urlLabel: "Webhook 地址", urlPlaceholder: "https://example.com/webhook" },
     telegram: { label: "Telegram 机器人", kind: "token", icon: "fa-brands fa-telegram",
@@ -3066,7 +3323,12 @@ function webhookBody(type, title, body) {
 //   webhook 类（企业微信 / 钉钉 / 飞书 / 通用）：直接 POST 到用户填的 URL（钉钉支持 SEC 加签）
 //   token 类（Telegram / PushPlus / Bark）：用 Token / 设备密钥拼出官方接口地址
 async function buildChannelRequest(c, title, body) {
-    const text = `${title}\n${body}`.trim();
+    // 统一加「发送时间」页脚：外部推送（尤其手机通知）经常脱离站内上下文，
+    //   没有时间戳就无法判断这条是刚发生的还是延迟补发的。
+    const stamp = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 19).replace("T", " ");
+    const footer = `发送时间：${stamp}（北京时间）`;
+    const bodyFull = body ? `${body}\n\n——\n${footer}` : `${title}\n\n——\n${footer}`;
+    const text = `${title}\n${bodyFull}`.trim();
     const t = c.channel_type;
     if (t === "telegram") {
         const token = String(c.webhook_url || "").trim();
@@ -3079,18 +3341,22 @@ async function buildChannelRequest(c, title, body) {
         const token = String(c.webhook_url || "").trim();
         if (!token) return null;
         return { url: "https://www.pushplus.plus/send", method: "POST",
-            json: { token, title, content: body, template: "txt" } };
+            json: { token, title, content: bodyFull, template: "txt" } };
     }
     if (t === "bark") {
         const raw = String(c.webhook_url || "").trim();
         if (!raw) return null;
         const url = /^https?:\/\//i.test(raw) ? safeWebhook(raw) : `https://api.day.app/${encodeURIComponent(raw)}`;
         if (!url) return null;
-        return { url, method: "POST", json: { title, body, isArchive: 1 } };
+        return { url, method: "POST", json: { title, body: bodyFull, isArchive: 1 } };
     }
     // webhook 类：地址必须是合法公网 http/https
     let wu = safeWebhook(c.webhook_url);
     if (!wu) return null;
+    // ShowDoc 推送服务：POST 表单 title + content（两个都不能为空），GET 传 text/desp 会被判空
+    if (t === "showdoc") {
+        return { url: wu, method: "POST", form: { title, content: bodyFull } };
+    }
     if (t === "dingtalk" && String(c.secret || "").trim()) {
         const secret = String(c.secret).trim();
         const ts = Date.now();
@@ -3100,16 +3366,20 @@ async function buildChannelRequest(c, title, body) {
         u.searchParams.set("sign", sign);
         wu = u.href;
     }
-    return { url: wu, method: "POST", json: webhookBody(t, title, body) };
+    return { url: wu, method: "POST", json: webhookBody(t, title, bodyFull) };
 }
 
-// 把一次请求真正发出去（GET 拼 qs / POST 发 JSON），并更新通道状态
+// 把一次请求真正发出去（GET 拼 qs / POST 发 JSON 或表单），并更新通道状态
 async function sendChannelRequest(env, c, req) {
     try {
         const init = { method: req.method, headers: {} };
         if (req.method === "POST" && req.json) {
             init.headers["Content-Type"] = "application/json";
             init.body = JSON.stringify(req.json);
+        }
+        if (req.method === "POST" && req.form) {
+            init.headers["Content-Type"] = "application/x-www-form-urlencoded;charset=utf-8";
+            init.body = new URLSearchParams(req.form).toString();
         }
         if (req.method === "GET" && req.qs) {
             const u = new URL(req.url);
@@ -3118,8 +3388,11 @@ async function sendChannelRequest(env, c, req) {
         }
         const r = await fetchWithTimeout(req.url, init, 8000);
         const t = (await r.text()).slice(0, 200);
-        await markChannel(env, c.id, r.ok ? "success" : "failed", r.ok ? (t || "ok") : `HTTP ${r.status} ${t}`);
-        return r.ok;
+        // ShowDoc 这类国产推送服务习惯用 HTTP 200 + error_code 表达失败，不能只看状态码
+        const bizFail = /"error_code"\s*:\s*[1-9]/.test(t);
+        const ok = r.ok && !bizFail;
+        await markChannel(env, c.id, ok ? "success" : "failed", ok ? (t || "ok") : `HTTP ${r.status} ${t}`);
+        return ok;
     } catch (e) {
         await markChannel(env, c.id, "failed", String(e && e.message || e).slice(0, 200));
         return false;
@@ -3181,9 +3454,23 @@ async function evaluateAlerts(env, quotes) {
             if (now - Number(a.last_trigger_epoch || 0) < coolMs) continue;
             const win = Math.floor(now / coolMs);
             const unitPct = a.direction === "rise" || a.direction === "fall";
-            const cond = `${ALERT_DIRECTIONS[a.direction] || a.direction} ${target}${unitPct ? "%" : ""}`;
-            const title = `价格预警 · ${a.name || q.name || a.symbol}`;
-            const body = `现价 ${price}${q.unit || ""}（${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%），触发条件：${cond}`;
+            const qUnit = String(q.unit || "");
+            const cond = `${ALERT_DIRECTIONS[a.direction] || a.direction} ${target}${unitPct ? "%" : qUnit}`;
+            const num = v => (Number(v) > 0 ? String(round2(Number(v))) : "—");
+            const chgAbs = Number(q.change) || 0;
+            const title = `价格预警 · ${a.name || q.name || a.symbol}（${a.symbol}）`;
+            // 正文给足以判断的上下文：品种 / 现价 / 涨跌 / 日内区间 / 触发条件 / 行情时间 / 上次触发
+            const body = [
+                `品种：${a.name || q.name || a.symbol}（${a.symbol}）`,
+                `现价：${round2(price)}${qUnit}（${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%）`,
+                `涨跌：${chgAbs >= 0 ? "+" : ""}${round2(chgAbs)}${qUnit}`,
+                `日内：开 ${num(q.open)} / 高 ${num(q.high)} / 低 ${num(q.low)} / 昨结 ${num(q.prev_close)}`,
+                `触发条件：${cond}`,
+                `行情时间：${q.quote_time || q.updated_at || nowBeijing()}`,
+                a.last_trigger_at ? `上次触发：${a.last_trigger_at}` : "上次触发：无（首次触发）",
+                "",
+                "规则提醒，非投资建议"
+            ].join("\n");
             const written = await pushNotification(env, {
                 kind: "alert", level: "warn", title, body,
                 ref_type: "alert", ref_id: a.id, dedup_key: `alert:${a.id}:${win}`
@@ -3319,9 +3606,13 @@ async function handleNotifications(request, env, user, url) {
 }
 
 // 未读通知按类型统计（通知中心的分类角标用）
+//   铃铛每 60 秒轮询一次，这条 GROUP BY 要扫全表（150+ 行），用 2 分钟缓存挡掉一半请求。
 async function unreadByKind(env) {
     try {
-        const rows = (await env.DB.prepare("SELECT kind, COUNT(*) c FROM notifications WHERE read=0 GROUP BY kind").all()).results || [];
+        const rows = await aggCached(env, "notify.unreadKind", async () => {
+            const r = (await env.DB.prepare("SELECT kind, COUNT(*) c FROM notifications WHERE read=0 GROUP BY kind").all()).results || [];
+            return r;
+        }, 120000);
         const out = {};
         rows.forEach(r => { out[r.kind] = Number(r.c) || 0; });
         return out;
@@ -3858,7 +4149,7 @@ async function getDesk(env, user, url) {
 
     // —— 近 14 天消息量趋势（口径与资讯中心一致：屏蔽词 + 四类相关性白名单）——
     //   趋势图已从资讯中心搬到投资总览，这里直接随 /api/desk 一起返回，前端不必再发一次请求。
-    const newsTrend = await newsDailyTrend(env, 14, relFilter.cond ? { cond: relFilter.cond, params: relFilter.params } : null);
+    //   与「系统概览」聚合一并走进 newsStatsBundle 的 3 分钟缓存（与资讯中心共用同一份）。
 
     // —— 系统总体统计（投资总览顶部的「系统概览」卡片区）——
     //   全部走与资讯中心一致的过滤口径（屏蔽词 + 四类相关性白名单），避免出现「卡片 936 条、列表 285 条」的矛盾。
@@ -3871,37 +4162,31 @@ async function getDesk(env, user, url) {
         try { return (await env.DB.prepare(sql).bind(...params).all()).results || []; }
         catch (e) { logWarn("desk.overview." + label, e); return []; }
     };
-    const [libStat, sentStat, chanStat, calStat, alertStat] = await Promise.all([
-        // 消息库总量 / 今日新增 / 重点消息数 / 收藏数
-        //   ⚠️ bind 顺序必须与 SQL 中占位符出现顺序严格一致：
-        //   每个子查询各自带一遍 relCond 参数，today 子句的参数夹在其 relCond 之后。
-        //   收藏数刻意**不**加相关性过滤 —— 与资讯中心 stats.starred 同口径（收藏是用户自己的行为，不该被四类白名单挡掉）。
-        safeStat("lib",
-            "SELECT (SELECT COUNT(*) FROM news WHERE 1=1" + relCond + ") total,"
-            + " (SELECT COUNT(*) FROM news WHERE 1=1" + relCond + " AND substr(published_at,1,10)=?) today,"
-            + " (SELECT COUNT(*) FROM news WHERE 1=1" + relCond + " AND is_key=1) key_count,"
-            + " (SELECT COUNT(*) FROM news WHERE starred=1) starred,"
-            + " (SELECT MAX(published_at) FROM news WHERE 1=1" + relCond + ") latest",
-            [...relParams, ...relParams, todayStr, ...relParams, ...relParams]),
-        // 全库消息的利多 / 利空 / 中性分布（整体倾向，非按标的）
-        safeAll("sentiment",
-            "SELECT sentiment, COUNT(*) c FROM news WHERE 1=1" + relCond + " GROUP BY sentiment",
-            relParams),
-        // 频道分布 Top 6
-        safeAll("channel",
-            "SELECT channel, COUNT(*) c FROM news WHERE 1=1" + relCond + " GROUP BY channel ORDER BY c DESC LIMIT 6",
-            relParams),
-        // 财经日历：未来 14 天事件
+    const [newsAgg, calStat, alertStat] = await Promise.all([
+        // 统计聚合与资讯中心共用同一份缓存（键 = 过滤条件 + 参数 + 日期，TTL 3 分钟）：
+        //   两个页面轮询的是同一组 COUNT / GROUP BY，没必要各算一遍。
+        //   行情 / 消息流 / 重点 Top / 日历 / 预警都不缓存，保持实时。
+        newsStatsBundle(env, relFilter.cond || "", relParams, todayStr),
+        // 财经日历：未来 14 天事件（小表，不必缓存）
         safeStat("calendar",
             "SELECT COUNT(*) total, SUM(CASE WHEN importance=3 THEN 1 ELSE 0 END) high,"
             + " SUM(CASE WHEN event_at>=? AND event_at<=? THEN 1 ELSE 0 END) upcoming_24h FROM eco_events WHERE event_at>=?",
             [nowBeijing(), beijingStamp(Date.now() + 86400000), nowBeijing()]),
-        // 价格预警：启用中 / 今日触发
+        // 价格预警：启用中 / 今日触发（小表，不必缓存）
         safeStat("alerts",
             "SELECT (SELECT COUNT(*) FROM price_alerts WHERE enabled=1) active,"
             + " (SELECT COUNT(*) FROM price_alerts WHERE last_trigger_at>=?) triggered_today",
             [todayStr])
     ]);
+    const newsTrend = newsAgg.trend;
+    const libStat = {
+        total: newsAgg.total, today: newsAgg.today, key_count: newsAgg.keyCount,
+        starred: newsAgg.starred, latest: newsAgg.latest
+    };
+    const sentStat = newsAgg.sentiment;
+    // 频道分布 Top 6（bundle 里是全量分布，与资讯中心共用）
+    const chanStat = (newsAgg.channel || []).slice()
+        .sort((a, b) => (Number(b.c) || 0) - (Number(a.c) || 0)).slice(0, 6);
 
     const sentimentDist = { bullish: 0, bearish: 0, neutral: 0 };
     (sentStat || []).forEach(r => {
@@ -4207,15 +4492,20 @@ async function checkEcoReminders(env, windowMin = 30) {
         const mins = Math.max(0, Math.round((beijingEpoch(e.event_at) - now) / 60000));
         const warn = e.importance === 3 ? "danger" : e.importance === 2 ? "warn" : "info";
         const when = String(e.event_at).slice(11, 16);
-        const parts = [`${e.country} · ${e.event_at}`];
-        if (e.forecast) parts.push(`预期 ${e.forecast}${e.unit || ""}`);
-        if (e.previous) parts.push(`前值 ${e.previous}${e.unit || ""}`);
-        if (e.note) parts.push(e.note);
+        const impLabel = ["", "低", "中", "高"][Number(e.importance) || 1] || "中";
+        const parts = [
+            `${e.country} · ${e.event_at}（${mins} 分钟后公布）`,
+            `重要性：${impLabel}`,
+            e.forecast ? `预期 ${e.forecast}${e.unit || ""}` : "",
+            e.previous ? `前值 ${e.previous}${e.unit || ""}` : "",
+            e.actual ? `公布值 ${e.actual}${e.unit || ""}` : "",
+            e.note || ""
+        ].filter(Boolean);
         const okPush = await pushNotification(env, {
             kind: "calendar",
             level: warn,
             title: `${mins} 分钟后公布：${e.name}`,
-            body: parts.join(" · "),
+            body: parts.join("\n"),
             ref_type: "eco_event",
             ref_id: e.id,
             // 同一事件同一时间只提醒一次；改了时间会换 key
@@ -4410,7 +4700,7 @@ const ACQUIRE_OPTION_DEFAULTS = [
     // —— 消息数据 · 运行控制 ——
     { domain: "news", group: "runtime", key: "news_timeout_sec", name: "超时", value: "9", type: "number", unit: "秒", meta: JSON.stringify({ min: 3, max: 30, step: 1 }), description: "每个数据源单次 HTTP 请求的最长等待时间；网络慢时调大，避免整批抓取超时", sort: 80 },
     { domain: "news", group: "runtime", key: "news_fail_limit", name: "失败", value: "5", type: "number", unit: "次", meta: JSON.stringify({ min: 1, max: 50, step: 1 }), description: "任务连续失败达到该次数后自动停用，并发一条通知；修复后到「定时任务」重新启用即可清零", sort: 90 },
-    { domain: "news", group: "runtime", key: "news_live_sec", name: "刷新", value: "10", type: "number", unit: "秒", meta: JSON.stringify({ min: 5, max: 300, step: 5 }), description: "资讯列表自动刷新的间隔，只读数据库不抓源，默认 10 秒", sort: 92 },
+    { domain: "news", group: "runtime", key: "news_live_sec", name: "刷新", value: "10", type: "number", unit: "秒", meta: JSON.stringify({ min: 5, max: 300, step: 5 }), description: "资讯列表自动刷新与回源抓取的间隔，默认 10 秒；页面轮询最密 30 秒（统计聚合缓存 3 分钟，再快也是重复读缓存；标签页在后台时暂停轮询）", sort: 92 },
     { domain: "news", group: "runtime", key: "news_crawl_sec", name: "抓取", value: "60", type: "number", unit: "秒", meta: JSON.stringify({ min: 10, max: 3600, step: 10 }), description: "服务端多久真正回源抓取一次资讯；过短容易被数据源限流，建议 ≥30 秒（定时任务仍按分钟兜底）", sort: 94 },
     // —— 消息数据 · 重点消息 ——
     { domain: "news", group: "key", key: "news_key_notify_max", name: "外部推送上限", value: "5", type: "number", unit: "条", meta: JSON.stringify({ min: 1, max: 20, step: 1 }), description: "每次采集完成后，最多把多少条「新采集的重点消息」推送到外部通道（企业微信 / 钉钉 / 飞书机器人）；写入通知中心不受此限制 —— 全部重点消息都会进通知中心", sort: 95 },
@@ -4428,7 +4718,7 @@ const ACQUIRE_OPTION_DEFAULTS = [
     { domain: "metal", group: "threshold", key: "metal_snapshot_surge", name: "波动", value: "0.25", type: "number", unit: "%", meta: JSON.stringify({ min: 0.05, max: 3, step: 0.05 }), description: "环比上次采集涨跌幅超过该值判定为明显波动（行情快照等级：明显波动）；需小于「异动」阈值", sort: 60 },
     // —— 贵金属数据 · 运行控制 ——
     { domain: "metal", group: "runtime", key: "metal_fail_limit", name: "失败", value: "5", type: "number", unit: "次", meta: JSON.stringify({ min: 1, max: 50, step: 1 }), description: "行情任务连续失败达到该次数后自动停用，并发一条通知，避免对已失效的接口持续重试", sort: 70 },
-    { domain: "metal", group: "runtime", key: "metal_live_sec", name: "刷新", value: "10", type: "number", unit: "秒", meta: JSON.stringify({ min: 5, max: 120, step: 5 }), description: "页面轮询与服务端重新回源拉取行情的间隔，默认 10 秒；调小更实时，但会更频繁请求新浪行情接口", sort: 75 },
+    { domain: "metal", group: "runtime", key: "metal_live_sec", name: "刷新", value: "10", type: "number", unit: "秒", meta: JSON.stringify({ min: 5, max: 120, step: 5 }), description: "行情页轮询与服务端重新回源拉取行情的间隔，默认 10 秒；调小更实时，但会更频繁请求新浪行情接口。投资总览页最密 30 秒（聚合统计缓存 3 分钟）", sort: 75 },
     // —— 贵金属数据 · 留存与展示 ——
     { domain: "metal", group: "lifecycle", key: "metal_snapshot_keep", name: "快照条数", value: "2000", type: "number", unit: "条", meta: JSON.stringify({ min: 100, max: 20000, step: 100 }), description: "金价快照最多保留的条数；与快照天数哪个先到就按哪个清理", sort: 80 },
     { domain: "metal", group: "lifecycle", key: "metal_snapshot_days", name: "快照天数", value: "90", type: "number", unit: "天", meta: JSON.stringify({ min: 1, max: 3650, step: 1 }), description: "金价快照保留天数：超过该天数的快照自动清理；与快照条数哪个先到就按哪个清理", sort: 81 },
@@ -4764,20 +5054,36 @@ async function upsertQuotes(env, quotes) {
 // 贵金属与稀有金属共用本地价格轨迹和留存策略。
 async function recordQuoteHistory(env, quotes) {
     if (!quotes.length) return 0;
-    const last = await env.DB.prepare("SELECT symbol, price FROM metal_history WHERE id IN (SELECT MAX(id) FROM metal_history GROUP BY symbol)").all();
+    // 逐品种取「最后一条价格」：走 idx_metal_history_sym，每个品种只读 1 行。
+    //   旧写法 `id IN (SELECT MAX(id) ... GROUP BY symbol)` 每次都要扫完整张轨迹表
+    //   （实测 52 次 × 1,386 行 ≈ 7.2 万行/天），换成 batch 里一人一条。
     const lastMap = {};
-    (last.results || []).forEach(r => { lastMap[r.symbol] = Number(r.price); });
+    try {
+        const res = await env.DB.batch(quotes.map(q => env.DB.prepare(
+            "SELECT price FROM metal_history WHERE symbol=? ORDER BY id DESC LIMIT 1"
+        ).bind(q.symbol)));
+        (res || []).forEach((r, i) => {
+            const row = r && r.results && r.results[0];
+            if (row) lastMap[quotes[i].symbol] = Number(row.price);
+        });
+    } catch (e) { logWarn("metal.history.last", e); }
     const changed = quotes.filter(q => lastMap[q.symbol] !== Number(q.price));
     if (changed.length) {
         const his = env.DB.prepare("INSERT INTO metal_history(symbol,price,quote_time,created_at) VALUES(?,?,?,CURRENT_TIMESTAMP)");
         await env.DB.batch(changed.map(q => his.bind(q.symbol, q.price, q.quote_time)));
     }
-    // 清理即使在本轮没有价格变化时也执行，避免稀有金属历史长期超出配置。
+    // 条数裁剪：按品种取「第 keep 条」的主键做边界，走 idx_metal_history_sym，只读 keep 行。
+    //   旧写法用 ROW_NUMBER() 窗口函数分区排序，每次刷新都扫全表
+    //   （实测 94 次 × 4,109 行 ≈ 38.6 万行/天，是读额度的第二大消耗）。
     const keep = await acquireNum(env, "metal", "metal_history_keep", 500, 50, 5000);
-    await env.DB.prepare("DELETE FROM metal_history WHERE id IN (SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY id DESC) rn FROM metal_history) WHERE rn > ?)").bind(keep).run();
-    const days = await acquireNum(env, "metal", "metal_history_days", 30, 1, 3650);
-    const cutoff = new Date(Date.now() - days * 86400000).toISOString().replace("T", " ").slice(0, 19);
-    await env.DB.prepare("DELETE FROM metal_history WHERE created_at < ?").bind(cutoff).run();
+    try {
+        await env.DB.batch(quotes.map(q => env.DB.prepare(
+            "DELETE FROM metal_history WHERE symbol=? AND id < "
+            + "(SELECT id FROM metal_history WHERE symbol=? ORDER BY id DESC LIMIT 1 OFFSET ?)"
+        ).bind(q.symbol, q.symbol, Math.max(0, Math.floor(keep) - 1))));
+    } catch (e) { logWarn("metal.history.prune", e); }
+    // 按天清理（created_at 没有索引，是整表扫描）已挪到 pruneRetentionIfDue，每天只跑一次，
+    //   不再跟着每次行情刷新扫一遍。
     return changed.length;
 }
 
@@ -7204,6 +7510,19 @@ async function pruneRetentionIfDue(env) {
         await trimByKeep(env, "metal_snapshots", "epoch", snapKeep);
     } catch (e) { logWarn("prune.snapshots", e); }
 
+    // 价格轨迹（metal_history）按天清理：created_at 上没有索引，属于整表扫描，
+    //   从「每次行情刷新」挪到这里的每日一次（旧位置实测每天 4 万行读取，且基本删不到东西）。
+    try {
+        const hisDays = await acquireNum(env, "metal", "metal_history_days", 30, 1, 3650);
+        const hisCutoff = new Date(Date.now() - hisDays * 86400000).toISOString().replace("T", " ").slice(0, 19);
+        await env.DB.prepare("DELETE FROM metal_history WHERE created_at < ?").bind(hisCutoff).run();
+    } catch (e) { logWarn("prune.metalHistory", e); }
+
+    // 聚合缓存表只保留 7 天内写过的键（正常每天只有个位数到几十个键）
+    try {
+        await env.DB.prepare("DELETE FROM agg_cache WHERE at < ?").bind(Date.now() - 7 * 86400000).run();
+    } catch (e) { logWarn("prune.aggCache", e); }
+
     // 记录本次清理日期：即使上面某项失败也记，避免每次采集都重试刷读行数
     try {
         await env.DB.prepare("INSERT INTO settings(key,value) VALUES('last_cleanup_day',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
@@ -8354,6 +8673,8 @@ async function importAcquireConfig(request, env) {
     }
     for (let i = 0; i < writes.length; i += 100) await env.DB.batch(writes.slice(i, i + 100));
     invalidateAcquireOptions();
+    // 屏蔽词 / 相关性开关可能被改：聚合条件与 relevant 标记都会变，统计缓存直接失效
+    await invalidateAggCache(env);
     return json({ success: true, applied, ignored, message: applied ? `已应用 ${applied} 项配置` : "没有可应用的配置项" });
 }
 
@@ -8370,6 +8691,7 @@ async function resetAcquireParams(request, env) {
         ON CONFLICT(option_key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP`)
         .bind(o.domain, o.key, o.name, o.value, o.type, o.options || "", o.meta || "", o.description || "", o.sort)));
     invalidateAcquireOptions();
+    await invalidateAggCache(env);
     return json({ success: true, reset: defs.map(o => o.key), defaults: defs.reduce((m, o) => (m[o.key] = o.value, m), {}) });
 }
 

@@ -1537,6 +1537,8 @@ async function viewMetalsQuote(container) {
     // 自动刷新：按服务端配置的间隔轮询（默认 10 秒），只拉贵金属表格，不重复请求银行接口
     const tick = () => {
         if (mySeq !== routerSeq) return;
+        // 标签页在后台时不轮询行情（数据没人看，回来一个周期内自动补上）
+        if (document.hidden) { viewTimer = setTimeout(tick, Math.max(5, liveSec) * 1000); return; }
         load().catch(() => {}).then(() => {
             if (mySeq !== routerSeq) return;
             viewTimer = setTimeout(tick, Math.max(5, liveSec) * 1000);
@@ -2961,15 +2963,19 @@ async function viewNews(container) {
     $("#n-starred-only").addEventListener("change", () => { newsPage.offset = 0; load(); });
     $("#n-show-all").addEventListener("change", () => { newsPage.offset = 0; load(); });
     load();
-    // 自动刷新：按服务端配置的间隔轮询（数据采集页 · 资讯页刷新间隔，默认 10 秒）
+    // 自动刷新：按服务端配置的间隔轮询（数据采集页 · 资讯页刷新间隔，默认 10 秒）。
+    //   列表本身每次都会拉（保证新消息及时出现），但统计聚合在服务端缓存 3 分钟；
+    //   前端最密 30 秒一轮，标签页在后台时暂停轮询。
     const newsTick = () => {
         if (mySeq !== routerSeq) return;
+        // 标签页在后台不轮询（列表也没人看），回到前台最迟一个周期后自动补一次
+        if (document.hidden) { viewTimer = setTimeout(newsTick, Math.max(30, liveSec) * 1000); return; }
         load(true).catch(() => {}).then(() => {
             if (mySeq !== routerSeq) return;
-            viewTimer = setTimeout(newsTick, Math.max(5, liveSec) * 1000);
+            viewTimer = setTimeout(newsTick, Math.max(30, liveSec) * 1000);
         });
     };
-    viewTimer = setTimeout(newsTick, Math.max(5, liveSec) * 1000);
+    viewTimer = setTimeout(newsTick, Math.max(30, liveSec) * 1000);
 }
 
 // 消息备注弹窗（回填已有备注，避免打开就保存导致原备注被清空）
@@ -4311,10 +4317,14 @@ async function viewDesk(container) {
     }
     await render(false).catch(e => { if (seq === routerSeq) pane.innerHTML = errorHtml(e.message); });
     // 自动刷新：与行情页同源配置（数据采集 → 贵金属数据区 → 行情页刷新间隔，默认 10 秒）；
-    // 总览要做持仓 / 消息 / 预警的聚合计算，最密 15 秒一次，避免把数据库压满。
-    const refreshMs = () => Math.max(15, Number((deskState.data || {}).live_sec) || 10) * 1000;
+    // 总览要做持仓 / 消息 / 预警的聚合计算，最密 30 秒一次（服务端聚合已缓存 3 分钟），
+    //   再快也只是重复读缓存，纯属浪费请求配额；标签页在后台时暂停轮询。
+    const refreshMs = () => Math.max(30, Number((deskState.data || {}).live_sec) || 10) * 1000;
     const tick = () => {
         if (seq !== routerSeq) return;
+        // 标签页在后台 / 窗口最小化时不轮询（回来最多等一个周期就会补上），
+        //   否则「网页挂着不看」会白烧一天的读配额。
+        if (document.hidden) { viewTimer = setTimeout(tick, refreshMs()); return; }
         render(true).catch(() => {}).then(() => {
             if (seq !== routerSeq) return;
             viewTimer = setTimeout(tick, refreshMs());

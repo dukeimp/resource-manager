@@ -199,6 +199,52 @@ t("maskSecretValue 正确脱敏敏感字段", () => {
         console.log("FAIL Bark 自定义 URL 同样受 SSRF 内网拦截保护 -> " + e.message);
     }
 
+    // —— ShowDoc 推送：POST 表单 title + content（服务端 GET 传 text/desp 会判「标题和内容都不能为空」）——
+    try {
+        const sd = await S.buildChannelRequest({
+            channel_type: "showdoc",
+            webhook_url: "https://push.showdoc.com.cn/server/api/push/abc123"
+        }, "预警：沪金上破 900", "当前 905.2 元/克");
+        eq(sd && sd.method, "POST", "ShowDoc 必须用 POST");
+        eq(sd && sd.url, "https://push.showdoc.com.cn/server/api/push/abc123", "推送地址应原样保留");
+        eq(sd && sd.form && sd.form.title, "预警：沪金上破 900", "title 取通知标题");
+        if (!sd.form.content.startsWith("当前 905.2 元/克")) throw new Error("content 应以正文开头: " + sd.form.content);
+        if (!/发送时间：\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}（北京时间）/.test(sd.form.content)) {
+            throw new Error("content 缺少发送时间页脚: " + sd.form.content);
+        }
+        eq(sd && sd.json, undefined, "不能发 JSON body");
+        pass++;
+        console.log("PASS ShowDoc 通道使用 title/content 表单提交");
+    } catch (e) {
+        fail++;
+        console.log("FAIL ShowDoc 通道使用 title/content 表单提交 -> " + e.message);
+    }
+
+    try {
+        const sdEmpty = await S.buildChannelRequest({
+            channel_type: "showdoc", webhook_url: "https://push.showdoc.com.cn/server/api/push/abc123"
+        }, "只有标题", "");
+        eq(sdEmpty && sdEmpty.form && sdEmpty.form.content.startsWith("只有标题"), true, "正文为空时用标题兜底，避免被判空");
+        eq(/发送时间：/.test(sdEmpty.form.content), true, "兜底后仍带发送时间");
+        pass++;
+        console.log("PASS ShowDoc 正文为空时用标题兜底");
+    } catch (e) {
+        fail++;
+        console.log("FAIL ShowDoc 正文为空时用标题兜底 -> " + e.message);
+    }
+
+    try {
+        const sdBad = await S.buildChannelRequest({
+            channel_type: "showdoc", webhook_url: "http://192.168.1.9/push"
+        }, "标题", "正文");
+        eq(sdBad, null, "ShowDoc 也要挡内网地址");
+        pass++;
+        console.log("PASS ShowDoc 同样受 SSRF 内网拦截保护");
+    } catch (e) {
+        fail++;
+        console.log("FAIL ShowDoc 同样受 SSRF 内网拦截保护 -> " + e.message);
+    }
+
     console.log("\n通过 " + pass + " / " + (pass + fail));
     process.exit(fail ? 1 : 0);
 })();
